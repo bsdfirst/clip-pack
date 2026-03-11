@@ -8,7 +8,7 @@ echo "Packing current directory: $(pwd)"
 echo ""
 
 # Create tar and capture checksum
-TAR_DATA=$(tar cf - . | tee >(shasum -a 256 | cut -d' ' -f1 > /tmp/clip-pack-checksum.txt) | xz -9e | base64)
+TAR_DATA=$(COPYFILE_DISABLE=1 tar cf - --exclude='.DS_Store' . | tee >(shasum -a 256 | cut -d' ' -f1 > /tmp/clip-pack-checksum.txt) | xz -9e | base64)
 
 CHECKSUM=$(cat /tmp/clip-pack-checksum.txt)
 rm -f /tmp/clip-pack-checksum.txt
