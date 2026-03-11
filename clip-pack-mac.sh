@@ -33,6 +33,6 @@ echo "$TAR_DATA" | pbcopy
 
 ENCODED_MB=$(echo "scale=2; $ENCODED_SIZE / 1024 / 1024" | bc)
 echo "Copied to clipboard: ${ENCODED_MB} MB (base64 encoded)"
-echo "Checksum (tar): ${CHECKSUM}"
+echo -e "Checksum (tar): \033[36m${CHECKSUM}\033[0m"
 echo ""
 echo "On the remote end, verify with this checksum."
