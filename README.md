@@ -4,19 +4,23 @@ Transfer directories between machines using the clipboard — designed for envir
 
 Files are tarred, xz-compressed (maximum), base64-encoded, and placed on the clipboard. A SHA-256 checksum of the tar archive is provided for verification on the receiving end.
 
+Large payloads are automatically split into chunks that are sent one at a time.
+
 ## Scripts
 
-| Script | Platform | Purpose |
-|---|---|---|
-| `clip-pack-mac.sh` | macOS | Pack current directory → clipboard |
-| `clip-pack-wsl.sh` | WSL2 | Pack current directory → clipboard |
-| `clip-unpack-mac.sh` | macOS | Clipboard → replace current directory |
-| `clip-unpack-wsl.sh` | WSL2 | Clipboard → replace current directory |
+| Script | Purpose |
+|---|---|
+| `clip-pack.sh` | Pack current directory → clipboard |
+| `clip-unpack.sh` | Clipboard → replace current directory |
+
+Both scripts auto-detect the platform (macOS or WSL2) and use the appropriate clipboard and checksum utilities.
+
+`clip-pack.sh` uses `bc` for human-readable size output (chunk and total payload). It is present by default on macOS and on typical WSL/Ubuntu images; install with your package manager if needed (e.g. `sudo apt install bc`).
 
 ## Setup
 
 ```bash
-chmod +x clip-pack-*.sh clip-unpack-*.sh
+chmod +x clip-pack.sh clip-unpack.sh
 ```
 
 Optionally, copy them somewhere on your `$PATH` (e.g. `~/bin/` or `/usr/local/bin/`).
@@ -31,59 +35,156 @@ export PATH=$PATH:/mnt/c/Windows/System32/WindowsPowerShell/v1.0
 
 ## Usage
 
-### Mac → WSL2
-
-On the Mac, `cd` into the directory you want to transfer:
+### Pack
 
 ```bash
 cd /path/to/project
-clip-pack-mac.sh
+clip-pack.sh                # default 50 MB chunk threshold
+clip-pack.sh -s 20          # 20 MB chunks (for restrictive Citrix limits)
 ```
 
-Note the checksum displayed. Paste is handled by the clipboard — just switch to the Citrix session.
+If the encoded payload fits in a single chunk, it is copied to the clipboard immediately. If it exceeds the threshold, the script splits it and sends each chunk automatically — after sending each chunk it waits for the unpack side to acknowledge receipt before sending the next.
 
-On WSL2, `cd` into the target directory (create it first if needed):
+Note the tar checksum displayed at the end.
+
+### Unpack
 
 ```bash
 mkdir -p /path/to/project && cd /path/to/project
-clip-unpack-wsl.sh
+clip-unpack.sh              # interactive — prompts for confirmation
+clip-unpack.sh -y           # skip all prompts
 ```
 
-Verify the checksum matches, then confirm extraction.
+For multi-chunk transfers, the unpack script automatically polls the clipboard every second and collects each chunk as it arrives. Checksums are verified per-chunk and for the overall tar archive.
 
-### WSL2 → Mac
+### Watch mode
 
-Same process in reverse using `clip-pack-wsl.sh` and `clip-unpack-mac.sh`.
+```bash
+clip-unpack.sh -w           # continuously poll, prompt before each extraction
+clip-unpack.sh -w -y        # continuously poll, auto-extract on arrival
+```
 
-## Size limit
+Watch mode polls the clipboard every second and processes new transfers as they arrive. Useful when making repeated transfers during development. Press Ctrl+C to stop.
 
-The scripts warn if the base64-encoded payload exceeds 60 MB. Citrix clipboard limits vary by configuration — the default is typically 512 KB, but admins may have raised it. If transfers fail silently or produce checksum mismatches, the payload is likely being truncated.
+### Paired transfers with `--id`
 
-For large transfers, consider:
+Use matching IDs on both sides to avoid picking up unrelated clipboard content:
 
-- Excluding build artefacts and dependencies (e.g. `node_modules/`, `.git/`, `__pycache__/`) by packing a subset instead of `.`
-- Splitting the payload manually with `split` and reassembling with `cat`
+```bash
+# Mac side
+clip-pack.sh -i myproject
+
+# WSL2 side
+clip-unpack.sh -i myproject          # ignores transfers without this ID
+clip-unpack.sh -w -y -i myproject    # watch mode, auto-extract, filtered
+```
+
+### Typical workflow (Mac → WSL2)
+
+On the Mac:
+
+```bash
+cd /path/to/project
+clip-pack.sh
+```
+
+Switch to the Citrix session. On WSL2:
+
+```bash
+mkdir -p /path/to/project && cd /path/to/project
+clip-unpack.sh
+```
+
+Verify the tar checksum matches, then confirm extraction. For the reverse direction, same process — the scripts detect the platform automatically.
+
+## Options
+
+### clip-pack.sh
+
+| Flag | Description |
+|---|---|
+| `-s`, `--size SIZE_MB` | Chunk size threshold in MB (default: 50). Must be a positive integer; maximum 8192. |
+| `-i`, `--id ID` | Set a transfer ID (default: random). Useful with `-i` on unpack to pair endpoints. |
+| `-h`, `--help` | Show help |
+
+### clip-unpack.sh
+
+| Flag | Description |
+|---|---|
+| `-y` | Skip all confirmation prompts |
+| `-w`, `--watch` | Continuously poll clipboard for new transfers |
+| `-i`, `--id ID` | Only accept transfers with this ID; ignore all others |
+| `-h`, `--help` | Show help |
+
+## Chunked transfer protocol
+
+Each clipboard payload includes a header:
+
+```
+CLIP-PACK-V1
+transfer-id=<8-char hex>
+chunk=<N>
+total=<M>
+chunk-sha256=<sha256 of the base64 data>
+tar-sha256=<sha256 of the original tar archive>
+---
+<base64-encoded payload>
+```
+
+Single-chunk transfers use `chunk=1` / `total=1`. The `transfer-id` is randomly generated by default but can be set explicitly with `-i` on the pack side. The unpack side uses it to distinguish new chunks from stale clipboard content when polling, and can filter on it with `-i` to ignore unrelated transfers.
+
+For multi-chunk transfers, the unpack side writes an acknowledgement after each chunk:
+
+```
+CLIP-PACK-ACK
+transfer-id=<id>
+chunk=<N>
+---
+```
+
+The pack side polls for this ACK before sending the next chunk, making multi-chunk transfers fully automatic once both sides are running.
+
+While waiting for an ACK, the pack side compares the clipboard to the payload it last sent. If the clipboard no longer matches that payload and no valid ACK has arrived within 10 seconds, it automatically resends the same chunk (for example if the clipboard was cleared or overwritten before the receiver read it).
+
+If the unpack side receives a chunk it has already stored (same transfer ID, lower chunk index than the one it is waiting for, with a valid checksum), it immediately sends another ACK for that chunk so the pack side can advance after a resend.
+
+## Size limits
+
+The default chunk threshold is 50 MB. Citrix clipboard limits vary by configuration — the default is typically 512 KB, but admins may have raised it. Use `-s` to match your environment's limit.
+
+If transfers fail silently or produce checksum mismatches, the payload is likely being truncated. Try a smaller chunk size.
+
+For very large directories, consider excluding build artefacts and dependencies (e.g. `node_modules/`, `.git/`, `__pycache__/`) by packing a subset instead of `.`.
 
 ## Safety guards
 
-- **Checksum verification** — the unpack scripts display the SHA-256 of the received tar and prompt you to confirm it matches before extracting.
+- **Per-chunk checksums** — each chunk is verified on arrival; transfer aborts on mismatch.
+- **Tar checksum** — the overall SHA-256 of the tar archive is verified after reassembly.
 - **Directory protection** — unpack refuses to run in `$HOME` or `/`.
-- **Confirmation prompt** — unpack warns that it will replace the current directory contents and requires explicit confirmation.
+- **Confirmation prompts** — unpack warns before replacing directory contents (skip with `-y`).
 
 ## Troubleshooting
 
+### `InitializeDefaultDrives` / `FileSystem` provider (WSL2)
+
+Windows PowerShell sometimes prints a stderr line such as *Attempting to perform the InitializeDefaultDrives operation on the 'FileSystem' provider failed* when it starts under WSL. It does not mean the clipboard read failed; the scripts discard that stream when calling PowerShell so the message should not appear. If you still see it from an older script version, you can ignore it when unpacking otherwise succeeds.
+
 ### `base64: invalid input` on WSL2
 
-Usually caused by `\r\n` line endings from PowerShell. The unpack script strips these with `tr -d '\r\n'`. If you still hit issues, dump the raw clipboard to a file and inspect:
+Usually caused by `\r\n` line endings from PowerShell. The unpack script strips these automatically. If you still hit issues, dump the raw clipboard to a file and inspect:
 
 ```bash
-powershell.exe -Command "[Console]::Out.Write((Get-Clipboard -Raw))" > raw.txt
+powershell.exe -NoProfile -NonInteractive -NoLogo -Command "[Console]::Out.Write((Get-Clipboard -Raw))" 2>/dev/null > raw.txt
 xxd raw.txt | head -20
 ```
 
 ### Checksum mismatch
 
-The clipboard payload was truncated — you've hit the Citrix size limit. Try reducing the payload size or ask your admin about the `MaximumClipboardTransferSizeLimitInKB` policy.
+The clipboard payload was truncated — you've hit the Citrix size limit. Try a smaller chunk size with `-s`:
+
+```bash
+clip-pack.sh -s 10    # 10 MB chunks
+```
 
 ### `powershell.exe: command not found`
 
